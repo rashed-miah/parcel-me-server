@@ -40,12 +40,12 @@ async function run() {
     const trackingCollection = myDB.collection("tracking");
     const usersCollection = myDB.collection("user");
     const ridersCollection = myDB.collection("riders");
+    const withdrawCollection = myDB.collection("transactions");
 
     // jwt token verify
 
     const verifyFirebaseToken = async (req, res, next) => {
       const authHeader = req.headers.authorization;
-      console.log("auth", authHeader);
 
       if (!authHeader?.startsWith("Bearer ")) {
         return res.status(401).send({ message: "Unauthorized" });
@@ -67,6 +67,15 @@ async function run() {
       const email = req.decoded.email;
       const user = await usersCollection.findOne({ email });
       if (!user || user?.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+    // verfiy rider
+    const verfiyRider = async (req, res, next) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+      if (!user || user?.role !== "rider") {
         return res.status(403).send({ message: "forbidden access" });
       }
       next();
@@ -128,6 +137,7 @@ async function run() {
         res.status(500).send(err.message);
       }
     });
+
     // Assign Rider API where parcelsCollection and rider collection are change their status
     app.patch(
       "/parcels/assign-rider/:parcelId",
@@ -176,7 +186,7 @@ async function run() {
       },
     );
 
-    // status update when rider receive and delivery parcel
+    // status update when rider receive and delivery parcel and rider earning set also here
     app.patch(
       "/parcels/rider-status/:id",
       verifyFirebaseToken,
@@ -184,19 +194,40 @@ async function run() {
         const id = req.params.id;
         const { status } = req.body;
 
+        // 🆕 FETCH PARCEL (REQUIRED FOR EARNING CALCULATION)
+        const parcel = await parcelsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!parcel) {
+          return res.status(404).send({ message: "Parcel not found" });
+        }
+
         const updateDoc = {
           $set: {
             deliveryStatus: status,
           },
         };
 
-        // add timestamps based on status
+        /* ---------------- PICKUP TIME ---------------- */
         if (status === "in-transit") {
           updateDoc.$set.pickedAt = new Date().toISOString();
         }
 
+        /* ---------------- DELIVERY + EARNING ---------------- */
         if (status === "completed") {
           updateDoc.$set.deliveredAt = new Date().toISOString();
+
+          // 🆕 SAME / DIFFERENT DISTRICT CHECK
+          const sameDistrict =
+            parcel.senderDistrict === parcel.receiverDistrict;
+
+          // 🆕 EARNING LOGIC
+          const earnPercentage = sameDistrict ? 0.8 : 0.3;
+          const riderEarn = Math.round(parcel.totalCost * earnPercentage);
+
+          // 🆕 SAVE EARNING
+          updateDoc.$set.rider_earn = riderEarn;
         }
 
         const result = await parcelsCollection.updateOne(
@@ -270,32 +301,45 @@ async function run() {
     });
 
     // POST – add tracking update
-    app.post("/tracking", async (req, res) => {
+    app.post("/tracking/update", verifyFirebaseToken, async (req, res) => {
       try {
-        const tracking = {
-          ...req.body,
-          createdAt: new Date(),
-        };
-        const result = await trackingCollection.insertOne(tracking);
+        const { trackingId, status, details, updated_by } = req.body;
+        if (!trackingId || !status) {
+          return res.status(400).send({
+            message: "trackingId and status are required",
+          });
+        }
+
+        // ✅ INSERT TRACKING RECORD
+        const result = await trackingCollection.insertOne({
+          trackingId,
+          status,
+          details,
+          updated_by,
+          time: new Date(),
+        });
+
         res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to add tracking update" });
+      } catch (err) {
+        res.status(500).send({
+          message: "Tracking update failed",
+        });
       }
     });
 
-    app.get("/tracking/:trackingId", verifyFirebaseToken, async (req, res) => {
+    app.get("/tracking/:trackingId", async (req, res) => {
       const { trackingId } = req.params;
 
-      const result = await trackingCollection
+      const records = await trackingCollection
         .find({ trackingId })
-        .sort({ createdAt: 1 })
+        .sort({ createdAt: 1 }) // oldest → newest
         .toArray();
 
-      if (!result.length) {
-        return res.status(404).send({ message: "Tracking not found" });
+      if (!records.length) {
+        return res.status(404).send({ message: "No tracking found" });
       }
 
-      res.send(result);
+      res.send(records);
     });
 
     // get payment history
@@ -442,11 +486,12 @@ async function run() {
         res.send(riders);
       },
     );
-    // rider pending deliveries for pending delivery
 
+    // rider pending deliveries for pending delivery
     app.get(
       "/rider/pending-deliveries",
       verifyFirebaseToken,
+      verfiyRider,
       async (req, res) => {
         const email = req.decoded.email;
 
@@ -458,6 +503,61 @@ async function run() {
           .toArray();
 
         res.send(parcels);
+      },
+    );
+
+    // GET rider completed deliveries
+    app.get(
+      "/rider/completed-deliveries",
+      verifyFirebaseToken,
+      verfiyRider,
+      async (req, res) => {
+        const email = req.decoded.email;
+
+        const parcels = await parcelsCollection
+          .find({
+            assignedRiderEmail: email,
+            deliveryStatus: "completed",
+          })
+          .sort({ deliveredAt: -1 })
+          .toArray();
+
+        res.send(parcels);
+      },
+    );
+    //cashout data store here
+    app.post(
+      "/rider/cashout",
+      verifyFirebaseToken,
+
+      async (req, res) => {
+        const { amount } = req.body;
+
+        const result = await withdrawCollection.insertOne({
+          riderEmail: req.decoded.email,
+          amount,
+          createdAt: new Date().toISOString(),
+        });
+
+        res.send(result);
+      },
+    );
+    // get cash out data
+    app.get(
+      "/rider/withdraw-total",
+      verifyFirebaseToken,
+      verfiyRider,
+      async (req, res) => {
+        const email = req.decoded.email;
+
+        const data = await withdrawCollection
+          .aggregate([
+            { $match: { riderEmail: email } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ])
+          .toArray();
+
+        res.send({ total: data[0]?.total || 0 });
       },
     );
 
@@ -559,6 +659,245 @@ async function run() {
         });
       }
     });
+
+    // Admin dashboard data
+
+    app.get(
+      "/dashboard/admin-stats",
+      verifyFirebaseToken,
+      verfiyAdmin,
+      async (req, res) => {
+        try {
+          // ================= PARCEL STATS =================
+          const parcelStats = await parcelsCollection
+            .aggregate([
+              {
+                $facet: {
+                  parcelCounts: [
+                    {
+                      $group: {
+                        _id: null,
+
+                        total: { $sum: 1 },
+
+                        paid: {
+                          $sum: {
+                            $cond: [{ $eq: ["$paymentStatus", "paid"] }, 1, 0],
+                          },
+                        },
+
+                        unpaid: {
+                          $sum: {
+                            $cond: [{ $ne: ["$paymentStatus", "paid"] }, 1, 0],
+                          },
+                        },
+
+                        // total customer paid
+                        totalRevenue: {
+                          $sum: {
+                            $cond: [
+                              { $eq: ["$paymentStatus", "paid"] },
+                              "$totalCost",
+                              0,
+                            ],
+                          },
+                        },
+
+                        // total rider earning
+                        totalRiderEarn: {
+                          $sum: {
+                            $cond: [
+                              { $eq: ["$deliveryStatus", "completed"] },
+                              "$rider_earn",
+                              0,
+                            ],
+                          },
+                        },
+
+                        // platform profit = totalCost - rider_earn
+                        platformRevenue: {
+                          $sum: {
+                            $cond: [
+                              {
+                                $and: [
+                                  { $eq: ["$paymentStatus", "paid"] },
+                                  { $eq: ["$deliveryStatus", "completed"] },
+                                ],
+                              },
+                              { $subtract: ["$totalCost", "$rider_earn"] },
+                              0,
+                            ],
+                          },
+                        },
+                      },
+                    },
+                  ],
+
+                  deliveryStatusCounts: [
+                    {
+                      $group: {
+                        _id: "$deliveryStatus",
+                        count: { $sum: 1 },
+                      },
+                    },
+                  ],
+                },
+              },
+            ])
+            .toArray();
+
+          // ================= USER ROLE STATS =================
+          const userRoleStats = await usersCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: "$role",
+                  count: { $sum: 1 },
+                },
+              },
+            ])
+            .toArray();
+
+          const roles = {};
+          userRoleStats.forEach((r) => {
+            roles[r._id] = r.count;
+          });
+
+          // ================= RIDER STATUS STATS =================
+          const riderStats = await ridersCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: "$status",
+                  count: { $sum: 1 },
+                },
+              },
+            ])
+            .toArray();
+
+          // ================= FORMAT DATA =================
+          const parcel = parcelStats[0]?.parcelCounts[0] || {
+            total: 0,
+            paid: 0,
+            unpaid: 0,
+            totalRevenue: 0,
+            totalRiderEarn: 0,
+            platformRevenue: 0,
+          };
+
+          const delivery = {};
+          parcelStats[0]?.deliveryStatusCounts.forEach((d) => {
+            delivery[d._id] = d.count;
+          });
+
+          const riders = {};
+          riderStats.forEach((r) => {
+            riders[r._id] = r.count;
+          });
+
+          // ================= FINAL RESPONSE =================
+          res.send({
+            parcelCounts: {
+              total: parcel.total,
+              paid: parcel.paid,
+              unpaid: parcel.unpaid,
+              totalRevenue: parcel.totalRevenue,
+              totalRiderEarn: parcel.totalRiderEarn,
+              platformRevenue: parcel.platformRevenue,
+            },
+
+            deliveryStatusCounts: {
+              rider_assign: delivery["rider_assign"] || 0,
+              in_transit: delivery["in-transit"] || 0,
+              completed: delivery["completed"] || 0,
+              not_collected: delivery["not-collected"] || 0,
+            },
+
+            riderCounts: {
+              active: riders.active || 0,
+              rejected: riders.rejected || 0,
+              deactivated: riders.deactivated || 0,
+            },
+
+            userRoleCounts: {
+              user: roles.user || 0,
+              rider: roles.rider || 0,
+              admin: roles.admin || 0,
+            },
+          });
+        } catch (err) {
+          res.status(500).send({
+            message: "Dashboard stats failed",
+            error: err.message,
+          });
+        }
+      },
+    );
+
+    // for rider dashboard
+    app.get(
+      "/dashboard/rider-stats",
+      verifyFirebaseToken,
+      verfiyRider,
+      async (req, res) => {
+        try {
+          const email = req.query.email;
+
+          if (!email) {
+            return res.status(400).send({ message: "Rider email required" });
+          }
+
+          const stats = await parcelsCollection
+            .aggregate([
+              {
+                $match: { assignedRiderEmail: email },
+              },
+              {
+                $facet: {
+                  // -------- DELIVERY STATUS --------
+                  deliveryStatus: [
+                    {
+                      $group: {
+                        _id: "$deliveryStatus",
+                        count: { $sum: 1 },
+                      },
+                    },
+                  ],
+
+                  // -------- TOTAL EARNED --------
+                  totalEarned: [
+                    {
+                      $group: {
+                        _id: null,
+                        total: { $sum: "$rider_earn" },
+                      },
+                    },
+                  ],
+                },
+              },
+            ])
+            .toArray();
+
+          const delivery = {};
+          stats[0].deliveryStatus.forEach((d) => {
+            delivery[d._id] = d.count;
+          });
+
+          res.send({
+            deliveryStatusCounts: {
+              rider_assign: delivery.rider_assign || 0,
+              completed: delivery.completed || 0,
+            },
+            totalEarned: stats[0].totalEarned[0]?.total || 0,
+          });
+        } catch (err) {
+          res.status(500).send({
+            message: "Rider stats failed",
+            error: err.message,
+          });
+        }
+      },
+    );
 
     // test route
     app.get("/", (req, res) => {
