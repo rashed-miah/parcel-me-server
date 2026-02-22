@@ -387,7 +387,7 @@ async function run() {
 
     // user insert here
     app.post("/users", async (req, res) => {
-      const { name, email, role, createdAt, lastLoginAt } = req.body;
+      const { name, email, role, URL, createdAt, lastLoginAt } = req.body;
 
       try {
         // 🔍 check if user exists
@@ -415,6 +415,7 @@ async function run() {
           name,
           email,
           role,
+          URL,
           createdAt,
           lastLoginAt,
         };
@@ -446,6 +447,42 @@ async function run() {
 
       res.send(result);
     });
+
+    app.get("/users/profile", verifyFirebaseToken, async (req, res) => {
+      try {
+        const email = req.decoded.email;
+
+        const user = await usersCollection.findOne({ email });
+
+        res.send(user);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to get profile" });
+      }
+    });
+
+    app.patch(
+      "/users/update-profile",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const email = req.decoded.email;
+          const { name, URL } = req.body;
+
+          const updateDoc = {
+            $set: {
+              name,
+              URL,
+            },
+          };
+
+          const result = await usersCollection.updateOne({ email }, updateDoc);
+
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "Profile update failed" });
+        }
+      },
+    );
 
     // rider data for fetch
     app.get("/riders", verifyFirebaseToken, verfiyAdmin, async (req, res) => {
